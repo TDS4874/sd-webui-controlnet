@@ -25,6 +25,7 @@ POSITIVE_MARK_TOKEN = 1024
 NEGATIVE_MARK_TOKEN = - POSITIVE_MARK_TOKEN
 MARK_EPS = 1e-3
 
+ANIMATEDIFF_STATE = 0
 
 def prompt_context_is_marked(x):
     t = x[..., 0, :]
@@ -339,6 +340,8 @@ class UnetHook(nn.Module):
         self.control_params = control_params
 
         outer = self
+        global ANIMATEDIFF_STATE
+        frfactors = [0.5, 0.3, 0.2, 0.1]
 
         def process_sample(*args, **kwargs):
             # ControlNet must know whether a prompt is conditional prompt (positive prompt) or unconditional conditioning prompt (negative prompt).
@@ -360,6 +363,9 @@ class UnetHook(nn.Module):
             require_inpaint_hijack = False
             is_in_high_res_fix = False
             batch_size = int(x.shape[0])
+
+            global ANIMATEDIFF_STATE
+            
 
             # Handle cond-uncond marker
             cond_mark, outer.current_uc_indices, context = unmark_prompt_context(context)
@@ -423,6 +429,7 @@ class UnetHook(nn.Module):
                 context = torch.cat([context, control.clone()], dim=1)
 
             # handle ControlNet / T2I_Adapter
+            control_count = 0
             for param in outer.control_params:
                 if no_high_res_control:
                     continue
@@ -432,6 +439,8 @@ class UnetHook(nn.Module):
 
                 if param.control_model_type not in [ControlModelType.ControlNet, ControlModelType.T2I_Adapter]:
                     continue
+
+                control_count += 1
 
                 param.control_model.to(devices.get_device_for("controlnet"))
                 # inpaint model workaround
@@ -492,6 +501,27 @@ class UnetHook(nn.Module):
                     control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
 
                 for idx, item in enumerate(control):
+
+                    # AnimateDiff-support
+                    if ANIMATEDIFF_STATE == 1:
+
+                        frame_count =  round(len(item) / 2)
+                        if control_count == 1 and frame_count > 7:
+
+                            for ifr, frfactor in enumerate(frfactors):
+                                item[ifr+1] *= frfactor
+                                item[frame_count+ifr+1] *= frfactor
+                            item[5:frame_count] = 0
+                            item[frame_count+5:] = 0
+
+                        elif control_count == 2 and frame_count > 7:
+
+                            for ifr, frfactor in enumerate(frfactors):
+                                item[frame_count * 2 - ifr - 2] *= frfactor
+                                item[frame_count - ifr - 2] *= frfactor
+                            item[frame_count:frame_count*2-5] = 0
+                            item[:frame_count-5] = 0
+                        
                     target = None
                     if param.control_model_type == ControlModelType.ControlNet:
                         target = total_controlnet_embedding
@@ -699,11 +729,34 @@ class UnetHook(nn.Module):
                         style_cfg = sum(self.style_cfgs) / float(len(self.style_cfgs))
                         self_attn1_uc = self.attn1(x_norm1, context=torch.cat([self_attention_context] + self.bank, dim=1))
                         self_attn1_c = self_attn1_uc.clone()
-                        if len(outer.current_uc_indices) > 0 and style_cfg > 1e-5:
-                            self_attn1_c[outer.current_uc_indices] = self.attn1(
-                                x_norm1[outer.current_uc_indices],
-                                context=self_attention_context[outer.current_uc_indices])
+
+                        # AnimateDiff support
+                        if ANIMATEDIFF_STATE == 1 and style_cfg == 0:
+                            self_attn1_c[:] = self.attn1(
+                                x_norm1[:],
+                                context=self_attention_context[:])
+
+
+                        if ANIMATEDIFF_STATE == 0:
+                            if len(outer.current_uc_indices) > 0 and style_cfg > 1e-5:
+                                self_attn1_c[outer.current_uc_indices] = self.attn1(
+                                    x_norm1[outer.current_uc_indices],
+                                    context=self_attention_context[outer.current_uc_indices])
                         self_attn1 = style_cfg * self_attn1_c + (1.0 - style_cfg) * self_attn1_uc
+
+                        # AnimateDiff support
+                        if ANIMATEDIFF_STATE == 1 and style_cfg == 0:
+                            frame_rf = len(outer.current_uc_indices)
+
+
+                            self_attn1[0] = 0 * self_attn1_c[0] + (1.0 - 0) * self_attn1_uc[0]
+                            self_attn1[1] = 0.1 * self_attn1_c[1] + (1.0 - 0.1) * self_attn1_uc[1]
+                            self_attn1[2] = 0.2 * self_attn1_c[2] + (1.0 - 0.2) * self_attn1_uc[2]
+                            self_attn1[frame_rf*2-1] = 0 * self_attn1_c[frame_rf*2-1] + (1.0 - 0) * self_attn1_uc[frame_rf*2-1]
+                            self_attn1[frame_rf*2-2] = 0.1 * self_attn1_c[frame_rf*2-2] + (1.0 - 0.1) * self_attn1_uc[frame_rf*2-2]
+                            self_attn1[frame_rf*2-3] = 0.2 * self_attn1_c[frame_rf*2-3] + (1.0 - 0.2) * self_attn1_uc[frame_rf*2-3]
+                            self_attn1[3:frame_rf*2-3] = 0.3 * self_attn1_c[3:frame_rf*2-3] + (1.0 - 0.3) * self_attn1_uc[3:frame_rf*2-3]
+
                     self.bank = []
                     self.style_cfgs = []
                 if self_attn1 is None:
@@ -753,6 +806,12 @@ class UnetHook(nn.Module):
         model.forward = forward_webui.__get__(model, UNetModel)
 
         all_modules = torch_dfs(model)
+
+        # AnimateDiff support
+        ANIMATEDIFF_STATE = 0
+        for i, module in enumerate(all_modules):
+            if "VanillaTemporalModule" in module.__class__.__name__:
+                ANIMATEDIFF_STATE = 1
 
         attn_modules = [module for module in all_modules if isinstance(module, BasicTransformerBlock)]
         attn_modules = sorted(attn_modules, key=lambda x: - x.norm1.normalized_shape[0])
