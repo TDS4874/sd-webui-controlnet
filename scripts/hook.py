@@ -746,7 +746,7 @@ class UnetHook(nn.Module):
 
                         # AnimateDiff support
                         if ANIMATEDIFF_STATE == 1 and style_cfg == 0:
-                            frame_rf = len(outer.current_uc_indices)
+                            frame_rf = round(len(self_attn1)/2)
 
 
                             self_attn1[0] = 0 * self_attn1_c[0] + (1.0 - 0) * self_attn1_uc[0]
