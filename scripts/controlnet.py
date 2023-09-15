@@ -9,6 +9,7 @@ import modules.scripts as scripts
 from modules import shared, devices, script_callbacks, processing, masking, images
 import gradio as gr
 import time
+import json
 
 
 from einops import rearrange
@@ -342,6 +343,7 @@ class Script(scripts.Script, metaclass=(
         if model_path.startswith("\"") and model_path.endswith("\""):
             model_path = model_path[1:-1]
 
+
         if not os.path.exists(model_path):
             raise ValueError(f"file not found: {model_path}")
 
@@ -364,7 +366,6 @@ class Script(scripts.Script, metaclass=(
                 return obj[idx]
             else:
                 return None
-
         attribute_value = get_element(getattr(p, attribute, None), strict)
         default_value = get_element(default)
         return attribute_value if attribute_value is not None else default_value
@@ -521,6 +522,7 @@ class Script(scripts.Script, metaclass=(
     @staticmethod
     def get_enabled_units(p):
         units = external_code.get_all_units_in_processing(p)
+
         if len(units) == 0:
             # fill a null group
             remote_unit = Script.parse_remote_call(p, Script.get_default_ui_unit(), 0)
@@ -555,6 +557,7 @@ class Script(scripts.Script, metaclass=(
             - Whether input image is from A1111.
         """
         image_from_a1111 = False
+
 
         p_input_image = Script.get_remote_call(p, "control_net_input_image", None, idx)
         image = image_dict_from_any(unit.image)
@@ -654,6 +657,7 @@ class Script(scripts.Script, metaclass=(
         if not batch_hijack.instance.is_batch:
             self.enabled_units = Script.get_enabled_units(p)
 
+
         if len(self.enabled_units) == 0:
            self.latest_network = None
            return
@@ -679,8 +683,10 @@ class Script(scripts.Script, metaclass=(
         for idx, unit in enumerate(self.enabled_units):
             Script.bound_check_params(unit)
 
+
             resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
             control_mode = external_code.control_mode_from_value(unit.control_mode)
+
 
             if unit.module in model_free_preprocessors:
                 model_net = None
@@ -694,6 +700,21 @@ class Script(scripts.Script, metaclass=(
                     p.controlnet_control_loras.append(control_lora)
 
             input_image, image_from_a1111 = Script.choose_input_image(p, unit, idx)
+
+            #for CN AD
+            with open('CN_AD.json', 'r', encoding='utf-8') as f:
+                CN_AD = json.load(f)
+            input_images_pass = CN_AD.get('input_images_pass', None)
+            _is_CN_AD_on = CN_AD.get('_is_CN_AD_on', None)
+
+            if _is_CN_AD_on:
+                input_images_files = sorted([os.path.join(input_images_pass, f) for f in os.listdir(input_images_pass) if f.endswith('.png')])
+                input_imageB = []
+                for img_file in input_images_files:
+                    with Image.open(img_file) as img:
+                        img_array = np.array(img)
+                        input_imageB.append(img_array)
+
             if image_from_a1111:
                 a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
                 if a1111_i2i_resize_mode is not None:
@@ -743,6 +764,11 @@ class Script(scripts.Script, metaclass=(
             # safe numpy
             logger.debug("Safe numpy convertion START")
             input_image = np.ascontiguousarray(input_image.copy()).copy()
+
+            # for CN AD
+            if _is_CN_AD_on:
+                for img_array in input_imageB:
+                    img_array = np.ascontiguousarray(img_array.copy()).copy()
             logger.debug("Safe numpy convertion END")
 
             logger.info(f"Loading preprocessor: {unit.module}")
@@ -812,6 +838,21 @@ class Script(scripts.Script, metaclass=(
                 thr_b=unit.threshold_b,
             )
 
+            # for CN AD
+            detected_mapB = []
+            detected_mapsB = []
+            controlB = []
+            if _is_CN_AD_on:
+                for img_array in input_imageB:
+                    detected_mapi, is_imagei = preprocessor(
+                        img_array, 
+                        res=preprocessor_resolution, 
+                        thr_a=unit.threshold_a,
+                        thr_b=unit.threshold_b,
+                    )
+                    detected_mapB.append(detected_mapi)
+
+
             if high_res_fix:
                 if is_image:
                     hr_control, hr_detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, hr_y, hr_x)
@@ -824,15 +865,32 @@ class Script(scripts.Script, metaclass=(
             if is_image:
                 control, detected_map = Script.detectmap_proc(detected_map, unit.module, resize_mode, h, w)
                 detected_maps.append((detected_map, unit.module))
+
+                # for CN AD
+                if _is_CN_AD_on:
+                    for detected_mapi in detected_mapB:
+                        controli, detected_mapi = Script.detectmap_proc(detected_mapi, unit.module, resize_mode, h, w)
+                        controlB.append(controli)
+                    detected_mapsB.append((detected_mapB, unit.module))
+
             else:
                 control = detected_map
                 detected_maps.append((input_image, unit.module))
+
+                # for CN AD
+                if _is_CN_AD_on:
+                    for detected_mapi in detected_mapB:
+                        controli = detected_mapi
+                        controlB.append(controli)
+                    detected_mapsB.append((input_imageB, unit.module))
+
 
             if control_model_type == ControlModelType.T2I_StyleAdapter:
                 control = control['last_hidden_state']
 
             if control_model_type == ControlModelType.ReVision:
                 control = control['image_embeds']
+
 
             preprocessor_dict = dict(
                 name=unit.module,
@@ -841,21 +899,44 @@ class Script(scripts.Script, metaclass=(
                 threshold_b=unit.threshold_b
             )
 
-            forward_param = ControlParams(
-                control_model=model_net,
-                preprocessor=preprocessor_dict,
-                hint_cond=control,
-                weight=unit.weight,
-                guidance_stopped=False,
-                start_guidance_percent=unit.guidance_start,
-                stop_guidance_percent=unit.guidance_end,
-                advanced_weighting=None,
-                control_model_type=control_model_type,
-                global_average_pooling=global_average_pooling,
-                hr_hint_cond=hr_control,
-                soft_injection=control_mode != external_code.ControlMode.BALANCED,
-                cfg_injection=control_mode == external_code.ControlMode.CONTROL,
-            )
+            # for CN AD
+            if _is_CN_AD_on:
+                forward_param = ControlParams(
+                    control_model=model_net,
+                    preprocessor=preprocessor_dict,
+                    hint_cond=control,
+                    weight=unit.weight,
+                    guidance_stopped=False,
+                    start_guidance_percent=unit.guidance_start,
+                    stop_guidance_percent=unit.guidance_end,
+                    advanced_weighting=None,
+                    control_model_type=control_model_type,
+                    global_average_pooling=global_average_pooling,
+                    hr_hint_cond=hr_control,
+                    soft_injection=control_mode != external_code.ControlMode.BALANCED,
+                    cfg_injection=control_mode == external_code.ControlMode.CONTROL,
+                    hint_condB=controlB,
+                )
+
+            else:
+
+                 forward_param = ControlParams(
+                    control_model=model_net,
+                    preprocessor=preprocessor_dict,
+                    hint_cond=control,
+                    weight=unit.weight,
+                    guidance_stopped=False,
+                    start_guidance_percent=unit.guidance_start,
+                    stop_guidance_percent=unit.guidance_end,
+                    advanced_weighting=None,
+                    control_model_type=control_model_type,
+                    global_average_pooling=global_average_pooling,
+                    hr_hint_cond=hr_control,
+                    soft_injection=control_mode != external_code.ControlMode.BALANCED,
+                    cfg_injection=control_mode == external_code.ControlMode.CONTROL,
+                )               
+
+
             forward_params.append(forward_param)
 
             if 'inpaint_only' in unit.module:
@@ -939,11 +1020,22 @@ class Script(scripts.Script, metaclass=(
         self.latest_network = UnetHook(lowvram=is_low_vram)
         self.latest_network.hook(model=unet, sd_ldm=sd_ldm, control_params=forward_params, process=p)
 
+        revision_conds = 0
+        revision_conds_weight = 0
         for param in forward_params:
+            if param.control_model_type == ControlModelType.ReVision:
+                revision_conds = revision_conds + param.hint_cond * param.weight
+                revision_conds_weight += param.weight
+        revision_conds_weight = max(revision_conds_weight, 1e-3)
+        self.latest_network.global_revision = revision_conds / revision_conds_weight
+
+        for param in forward_params:
+
             if param.control_model_type == ControlModelType.IPAdapter:
                 param.control_model.hook(
                     model=unet,
                     clip_vision_output=param.hint_cond,
+                    #clip_vision_outputs=param.hint_conds,
                     weight=param.weight,
                     dtype=torch.float32,
                     start=param.start_guidance_percent,
@@ -961,30 +1053,16 @@ class Script(scripts.Script, metaclass=(
         self.detected_map = detected_maps
         self.post_processors = post_processors
 
-    def controlnet_hack(self, p):
-        t = time.time()
-        self.controlnet_main_entry(p)
-        if len(self.enabled_units) > 0:
-            logger.info(f'ControlNet Hooked - Time = {time.time() - t}')
-        return
-
-    @staticmethod
-    def process_has_sdxl_refiner(p):
-        return getattr(p, 'refiner_checkpoint', None) is not None
-
-    def process(self, p, *args, **kwargs):
-        if not self.process_has_sdxl_refiner(p):
-            self.controlnet_hack(p)
-        return
-
     def before_process_batch(self, p, *args, **kwargs):
         if self.noise_modifier is not None:
             p.rng = HackedImageRNG(rng=p.rng,
                                    noise_modifier=self.noise_modifier,
                                    sd_model=p.sd_model)
         self.noise_modifier = None
-        if self.process_has_sdxl_refiner(p):
-            self.controlnet_hack(p)
+
+        t = time.time()
+        self.controlnet_main_entry(p)
+        logger.info(f'ControlNet Hooked - Time = {time.time() - t}')
         return
 
     def postprocess_batch(self, p, *args, **kwargs):
