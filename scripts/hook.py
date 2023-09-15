@@ -653,20 +653,21 @@ class UnetHook(nn.Module):
                 #for CN AD
                 if _is_CN_AD_on:
                     controlB = []
+                    frames = round(x_in.size(0)/2)
                     for idx,hinti in enumerate(hintB):
-                        x_ini = x_in[[idx, 16+idx]]
-                        contexti = context[[idx, 16+idx]]
-                        timestepsi = timesteps[[idx, 16+idx]]
+                        x_ini = x_in[[idx, frames+idx]]
+                        contexti = context[[idx, frames+idx]]
+                        timestepsi = timesteps[[idx, frames+idx]]
 
                         controli = param.control_model(x=x_ini, hint=hinti, timesteps=timestepsi, context=contexti, y=y)
                         controli = [c * scale for c, scale in zip(controli, control_scales)]
                         controlB.append(controli)
                     for idx,controlf in enumerate(controlB):
                         for idy, itemf in enumerate(controlf):
-                            new_shape = [itemf.size(0) * 16] + list(itemf.size()[1:])
+                            new_shape = [itemf.size(0) * frames] + list(itemf.size()[1:])
                             item = torch.zeros(new_shape).to(itemf.dtype).to(itemf.device)
                             item[idx] = itemf[0]
-                            item[16+idx] = itemf[1]
+                            item[frames+idx] = itemf[1]
 
                             target = None
                             if param.control_model_type == ControlModelType.ControlNet:
