@@ -675,15 +675,12 @@ class UnetHook(nn.Module):
                             if target is not None:
                                 target[idy] = item + target[idy]   
                    
+                    del controlB
+                    del target
 
 
 
 
-            #for CN AD
-            if _is_CN_AD_on:            
-
-                del controlB
-                del target
 
 
             # Replace x_t to support inpaint models
