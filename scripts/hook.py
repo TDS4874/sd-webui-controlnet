@@ -608,13 +608,13 @@ class UnetHook(nn.Module):
                             control = [torch.cat([c.clone() for _ in range(batch_size)], dim=0) for c in control]
                         control = [c * cond_mark for c in control]
 
-                    high_res_fix_forced_soft_injection = False
+                high_res_fix_forced_soft_injection = False
 
-                    if is_in_high_res_fix:
-                        if 'canny' in param.preprocessor['name']:
-                            high_res_fix_forced_soft_injection = True
-                        if 'mlsd' in param.preprocessor['name']:
-                            high_res_fix_forced_soft_injection = True
+                if is_in_high_res_fix:
+                    if 'canny' in param.preprocessor['name']:
+                        high_res_fix_forced_soft_injection = True
+                    if 'mlsd' in param.preprocessor['name']:
+                        high_res_fix_forced_soft_injection = True
 
                     # if high_res_fix_forced_soft_injection:
                     #     logger.info('[ControlNet] Forced soft_injection in high_res_fix in enabled.')
